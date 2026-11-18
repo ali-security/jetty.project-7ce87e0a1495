@@ -32,7 +32,8 @@ public class DefaultUserIdentity implements UserIdentity
     {
         _subject = subject;
         _userPrincipal = userPrincipal;
-        _roles = roles;
+        // Roles may be null (e.g. a JASPI module that sends no GroupPrincipalCallback), treat that as no roles.
+        _roles = roles == null ? new String[0] : roles;
     }
 
     @Override
@@ -62,6 +63,12 @@ public class DefaultUserIdentity implements UserIdentity
                 return true;
         }
         return false;
+    }
+
+    @Override
+    public String[] getRoles()
+    {
+        return _roles.clone();
     }
 
     @Override

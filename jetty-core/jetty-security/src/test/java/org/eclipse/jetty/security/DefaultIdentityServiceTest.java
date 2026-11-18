@@ -13,6 +13,13 @@
 
 package org.eclipse.jetty.security;
 
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.Principal;
+import javax.security.auth.Subject;
+
+import org.eclipse.jetty.security.authentication.SessionAuthentication;
 import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.Server;
@@ -20,10 +27,36 @@ import org.eclipse.jetty.util.Callback;
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.emptyArray;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 
 public class DefaultIdentityServiceTest
 {
+    @Test
+    public void testNullRolesUserIdentity() throws Exception
+    {
+        // A JASPI ServerAuthModule that sends no GroupPrincipalCallback results in null roles.
+        DefaultIdentityService identityService = new DefaultIdentityService();
+        Principal principal = new UserPrincipal("jaspiUser", null);
+        UserIdentity userIdentity = identityService.newUserIdentity(new Subject(), principal, null);
+        assertThat(userIdentity.getRoles(), emptyArray());
+        assertThat(userIdentity.isUserInRole("admin"), is(false));
+
+        // The identity can still be cached in the session, and the credentials are not serialized.
+        SessionAuthentication sessionAuthentication = new SessionAuthentication("TEST", userIdentity, "secretPassword");
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes))
+        {
+            out.writeObject(sessionAuthentication);
+        }
+        String serialized = bytes.toString(StandardCharsets.ISO_8859_1);
+        assertThat(serialized, containsString("jaspiUser"));
+        assertThat(serialized, not(containsString("secretPassword")));
+    }
+
     @Test
     public void testDefaultIdentityService() throws Exception
     {

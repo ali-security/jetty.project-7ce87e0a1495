@@ -25,7 +25,10 @@ import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.security.Constraint;
 import org.eclipse.jetty.security.DefaultIdentityService;
+import org.eclipse.jetty.security.NamePrincipal;
+import org.eclipse.jetty.security.RolePrincipal;
 import org.eclipse.jetty.security.SecurityHandler;
+import org.eclipse.jetty.security.UserIdentity;
 import org.eclipse.jetty.security.authentication.BasicAuthenticator;
 import org.eclipse.jetty.server.Handler;
 import org.eclipse.jetty.server.LocalConnector;
@@ -44,6 +47,7 @@ import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
@@ -237,5 +241,21 @@ public class JAASLoginServiceTest
         subject4.getPrincipals().add(new TestRole("y"));
         subject4.getPrincipals().add(new AnotherTestRole("z"));
         assertEquals(0, ls.getGroups(subject4).length);
+    }
+
+    @Test
+    public void testLogoutWithoutJAASUserPrincipal()
+    {
+        JAASLoginService ls = new JAASLoginService("foo");
+        ls.setIdentityService(new DefaultIdentityService());
+
+        //a user restored from a session without credentials has no JAASUserPrincipal
+        Subject subject = new Subject();
+        NamePrincipal principal = new NamePrincipal("user");
+        subject.getPrincipals().add(principal);
+        subject.getPrincipals().add(new RolePrincipal("role"));
+        UserIdentity user = ls.getIdentityService().newUserIdentity(subject, principal, new String[]{"role"});
+
+        assertDoesNotThrow(() -> ls.logout(user));
     }
 }

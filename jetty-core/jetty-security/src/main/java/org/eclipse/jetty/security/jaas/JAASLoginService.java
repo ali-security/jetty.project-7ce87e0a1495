@@ -253,6 +253,8 @@ public class JAASLoginService extends ContainerLifeCycle implements LoginService
     public void logout(UserIdentity user)
     {
         Set<JAASUserPrincipal> userPrincipals = user.getSubject().getPrincipals(JAASUserPrincipal.class);
+        if (userPrincipals.isEmpty())
+            return;
         LoginContext loginContext = userPrincipals.iterator().next().getLoginContext();
         try
         {
