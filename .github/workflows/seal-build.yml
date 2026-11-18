@@ -1,0 +1,162 @@
+# Sealed-build workflow for jetty-security 12.1.8.
+# Upstream jetty.project has no GitHub Actions build/test workflow (only CodeQL + stale);
+# the real build is the root Jenkinsfile: `mvn clean install -Dspotbugs.skip=true` on
+# JDK 17/21/25. This workflow mirrors that build, scoped to the jetty-security artifact
+# and to the modules whose sources/tests the security patches touch.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suites"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_VERSION: 3.9.14
+  MAVEN_OPTS: -Xmx3g -XX:MaxMetaspaceSize=512m
+  # Non-test gates (style/licence/static analysis/enforcer) are disabled; jacoco is kept as upstream's JDK17 leg does.
+  # The aether repository filters configured in .mvn/maven.config point at allowlists that upstream regenerates on
+  # its Jenkins (they ship empty), so they are turned off here.
+  MVN_ARGS: >-
+    -B -V -e --no-transfer-progress
+    -Daether.remoteRepositoryFilter.groupId=false
+    -Daether.remoteRepositoryFilter.prefixes=false
+    -Dmaven.build.cache.enabled=false
+    -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.skip=true
+    -Dlicense.skip=true -Denforcer.skip=true -Dgpg.skip=true
+    -Dmaven.javadoc.skip=true
+
+jobs:
+  build-test:
+    name: ${{ matrix.group }} (JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core
+            jdk: "17"
+            modules: jetty-core/jetty-security,jetty-core/jetty-client
+            upload: true
+          - group: core
+            jdk: "21"
+            modules: jetty-core/jetty-security,jetty-core/jetty-client
+          - group: core
+            jdk: "25"
+            modules: jetty-core/jetty-security,jetty-core/jetty-client
+          - group: ee9
+            jdk: "17"
+            modules: jetty-ee9/jetty-ee9-security,jetty-ee9/jetty-ee9-jaspi,jetty-ee9/jetty-ee9-openid,jetty-ee9/jetty-ee9-tests/jetty-ee9-test-integration
+          - group: ee10
+            jdk: "17"
+            modules: jetty-ee10/jetty-ee10-servlet,jetty-ee10/jetty-ee10-jaspi,jetty-ee10/jetty-ee10-tests/jetty-ee10-test-integration
+          - group: ee11
+            jdk: "17"
+            modules: jetty-ee11/jetty-ee11-servlet,jetty-ee11/jetty-ee11-jaspi,jetty-ee11/jetty-ee11-tests/jetty-ee11-test-integration
+          - group: integrations
+            jdk: "17"
+            modules: jetty-integrations/jetty-openid,jetty-integrations/jetty-ethereum
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+
+      - name: Install Maven ${{ env.MAVEN_VERSION }}
+        run: |
+          curl -fsSL "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o "$RUNNER_TEMP/maven.tgz"
+          tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Drop CI-only Maven extensions
+        # .mvn/extensions.xml registers the Mimir download-cache daemon (needs upstream's daemon config and
+        # deadlocks when it cannot start); .mvn/maven.config enables the empty repository allowlists.
+        # Neither affects what is compiled or packaged.
+        run: rm -f .mvn/extensions.xml .mvn/maven.config
+
+      - name: Build (install ${{ matrix.modules }} and their dependencies, tests compiled)
+        run: mvn $MVN_ARGS clean install -pl "${{ matrix.modules }}" -am -DskipTests
+
+      - name: Test ${{ matrix.modules }}
+        run: |
+          echo "Upstream CI (-Pci) excludes JUnit tags: external, large-disk-resource, stress, slow, flaky; mirrored here."
+          echo "JUnit 5 parallel class execution is switched off: on a 4-vCPU hosted runner concurrent test classes race on ports/buffers."
+          TEST_ARGS="--fail-at-end -DexcludedGroups=external,large-disk-resource,stress,slow,flaky -Djunit.jupiter.execution.parallel.enabled=false"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn $MVN_ARGS test -pl "${{ matrix.modules }}" $TEST_ARGS \
+              -Dtest="${{ inputs.test-filter }}" -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            mvn $MVN_ARGS test -pl "${{ matrix.modules }}" $TEST_ARGS
+          fi
+
+      - name: Test summary (per-module counts and every skipped test with its reason)
+        if: always()
+        shell: python
+        run: |
+          import glob, os, re, xml.etree.ElementTree as ET
+
+          def source_reason(mod, classname, method):
+              # Show the @Disabled / assume* source lines that cause the skip, so every skip states its reason.
+              path = os.path.join(mod, "src", "test", "java", *classname.split(".")) + ".java"
+              if not os.path.exists(path):
+                  return ""
+              lines = open(path, encoding="utf-8").read().splitlines()
+              found = []
+              for i, line in enumerate(lines):
+                  if re.search(r"\bvoid\s+" + re.escape(method) + r"\s*\(", line):
+                      j = i - 1
+                      while j >= 0 and (lines[j].strip().startswith("@") or not lines[j].strip()):
+                          if "@Disabled" in lines[j]:
+                              found.append(lines[j].strip())
+                          j -= 1
+                      depth, k = 0, i
+                      while k < len(lines):
+                          if re.search(r"assume|Assumptions\.", lines[k]):
+                              found.append(lines[k].strip())
+                          depth += lines[k].count("{") - lines[k].count("}")
+                          if depth <= 0 and "{" in "".join(lines[i:k + 1]):
+                              break
+                          k += 1
+                      break
+              for line in lines:
+                  if line.strip().startswith("@Disabled") and not found:
+                      found.append("class-level " + line.strip())
+              return " | source: " + " ; ".join(found) if found else ""
+
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for mod in "${{ matrix.modules }}".split(","):
+              m = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+              for f in sorted(glob.glob(os.path.join(mod, "target", "surefire-reports", "TEST-*.xml"))):
+                  root = ET.parse(f).getroot()
+                  for k in m:
+                      m[k] += int(root.get(k, 0) or 0)
+                  for tc in root.iter("testcase"):
+                      sk = tc.find("skipped")
+                      if sk is not None:
+                          msg = sk.get('message') or (sk.text or '').strip() or '(no message)'
+                          method = re.split(r"[\[(]", tc.get('name') or '')[0]
+                          print(f"SKIPPED {tc.get('classname')}#{tc.get('name')}: {msg}{source_reason(mod, tc.get('classname') or '', method)}")
+              passed = m["tests"] - m["failures"] - m["errors"] - m["skipped"]
+              print(f"MODULE {mod}: tests={m['tests']} passed={passed} failures={m['failures']} errors={m['errors']} skipped={m['skipped']}")
+              for k in tot:
+                  tot[k] += m[k]
+          passed = tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]
+          print(f"TOTAL ${{ matrix.group }} JDK${{ matrix.jdk }}: tests={tot['tests']} passed={passed} failures={tot['failures']} errors={tot['errors']} skipped={tot['skipped']}")
+
+      - name: Upload jetty-security jar
+        if: ${{ matrix.upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-security-jar
+          path: jetty-core/jetty-security/target/jetty-security-12.1.8.jar
+          if-no-files-found: error
